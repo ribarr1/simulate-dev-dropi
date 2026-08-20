@@ -1,0 +1,266 @@
+name: Deploy and Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      countries:
+        description: "Countries separated by comma. Example: CO,PE,MX"
+        required: true
+        default: "CO"
+        type: string
+
+      environment:
+        description: "Environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - pro
+
+      app_version:
+        description: "Application version"
+        required: true
+        default: "1.0.0"
+        type: string
+
+      cucumber_tags:
+        description: "Cucumber tags (optional - overrides country tag)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+
+  # ==========================================================
+  # 1. BUILD
+  # ==========================================================
+  build:
+    name: "1. Build Application"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Build application
+        shell: bash
+        run: |
+          echo "========================================"
+          echo " PIPELINE DE DESPLIEGUE - DROPI APP"
+          echo "========================================"
+          echo "App Version = ${{ inputs.app_version }}"
+          echo "Countries   = ${{ inputs.countries }}"
+          echo "Environment = ${{ inputs.environment }}"
+          echo "----------------------------------------"
+
+          echo "[build] Compilando aplicacion..."
+          sleep 2
+
+          echo "[build] Build completado exitosamente"
+
+
+  # ==========================================================
+  # 2. DEPLOY
+  # ==========================================================
+  deploy:
+    name: "2. Deploy to Environment"
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Deploy application
+        shell: bash
+        run: |
+          echo "[deploy] Desplegando version ${{ inputs.app_version }} \
+          en ${{ inputs.environment }} \
+          (${{ inputs.countries }})..."
+
+          sleep 3
+
+          echo "[deploy] Health check..."
+          sleep 1
+
+          echo "[deploy] Despliegue completado."
+
+
+  # ==========================================================
+  # 3. TRIGGER QA
+  # ==========================================================
+  trigger-qa:
+    name: "3. Trigger QA Automation"
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+
+      - name: Trigger QA workflows and wait for results
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.QA_GITHUB_TOKEN }}
+          COUNTRIES: ${{ inputs.countries }}
+          TEST_ENV: ${{ inputs.environment }}
+          CUSTOM_TAGS: ${{ inputs.cucumber_tags }}
+
+        run: |
+          set -e
+
+          QA_OWNER="ribarr1"
+          QA_REPO="gsqai_dropi_automation"
+          QA_WORKFLOW="run-smoke.yml"
+          QA_BRANCH="main"
+
+          echo "========================================"
+          echo " QA AUTOMATION"
+          echo "========================================"
+          echo "Countries   = $COUNTRIES"
+          echo "Environment = $TEST_ENV"
+          echo "----------------------------------------"
+
+          COUNTRIES_LIST=$(echo "$COUNTRIES" | tr ',' ' ')
+
+          > /tmp/qa_runs.txt
+
+          # ==================================================
+          # DISPARAR TODOS LOS PAISES
+          # ==================================================
+
+          for C in $COUNTRIES_LIST; do
+
+            C=$(echo "$C" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
+
+            case "$C" in
+              CO) TAG="@col" ;;
+              PE) TAG="@pe" ;;
+              MX) TAG="@mx" ;;
+              EC) TAG="@ec" ;;
+              CL) TAG="@cl" ;;
+              PA) TAG="@pa" ;;
+              AR) TAG="@ar" ;;
+              VE) TAG="@ve" ;;
+              CR) TAG="@cr" ;;
+              GT) TAG="@gt" ;;
+              PY) TAG="@py" ;;
+              *)
+                echo "[qa] ERROR: Pais no soportado: $C"
+                exit 1
+                ;;
+            esac
+
+            # Si CUCUMBER_TAGS fue enviado explícitamente,
+            # tiene prioridad sobre el tag del país.
+            if [ -n "$CUSTOM_TAGS" ]; then
+              TAG="$CUSTOM_TAGS"
+            fi
+
+            echo ""
+            echo "[qa] Disparando:"
+            echo "     COUNTRY=$C"
+            echo "     ENV=$TEST_ENV"
+            echo "     TAG=$TAG"
+
+            RESPONSE=$(curl -sS \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "https://api.github.com/repos/$QA_OWNER/$QA_REPO/actions/workflows/$QA_WORKFLOW/dispatches" \
+              -d "{
+                \"ref\": \"$QA_BRANCH\",
+                \"inputs\": {
+                  \"country\": \"$C\",
+                  \"environment\": \"$TEST_ENV\",
+                  \"cucumber_tags\": \"$TAG\",
+                  \"reporting_iteration_id\": \"1\"
+                }
+              }")
+
+            RUN_ID=$(echo "$RESPONSE" | jq -r '.workflow_run_id // empty')
+            RUN_URL=$(echo "$RESPONSE" | jq -r '.html_url // empty')
+
+            if [ -z "$RUN_ID" ]; then
+              echo "[qa] ERROR disparando QA para $C"
+              echo "$RESPONSE"
+              exit 1
+            fi
+
+            echo "[qa] Workflow creado."
+            echo "[qa] Run ID: $RUN_ID"
+            echo "[qa] URL: $RUN_URL"
+
+            echo "$C $RUN_ID" >> /tmp/qa_runs.txt
+
+          done
+
+
+          echo ""
+          echo "========================================"
+          echo " Todos los workflows fueron disparados"
+          echo " Esperando resultados..."
+          echo "========================================"
+
+          OVERALL_RESULT="SUCCESS"
+
+
+          # ==================================================
+          # ESPERAR RESULTADOS
+          # ==================================================
+
+          while read -r COUNTRY RUN_ID; do
+
+            echo ""
+            echo "[qa] Esperando resultado de $COUNTRY..."
+            echo "[qa] Run ID: $RUN_ID"
+
+            while true; do
+
+              RESPONSE=$(curl -sS \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                "https://api.github.com/repos/$QA_OWNER/$QA_REPO/actions/runs/$RUN_ID")
+
+              STATUS=$(echo "$RESPONSE" | jq -r '.status // "unknown"')
+              CONCLUSION=$(echo "$RESPONSE" | jq -r '.conclusion // ""')
+
+              echo "[qa] $COUNTRY status=$STATUS conclusion=$CONCLUSION"
+
+              if [ "$STATUS" = "completed" ]; then
+                break
+              fi
+
+              if [ "$STATUS" = "unknown" ]; then
+                echo "[qa] ERROR consultando workflow $RUN_ID"
+                echo "$RESPONSE"
+                OVERALL_RESULT="FAILED"
+                break
+              fi
+
+              sleep 15
+
+            done
+
+            echo ""
+            echo "[qa] $COUNTRY finalizado: $CONCLUSION"
+
+            if [ "$CONCLUSION" != "success" ]; then
+              OVERALL_RESULT="FAILED"
+            fi
+
+          done < /tmp/qa_runs.txt
+
+
+          # ==================================================
+          # RESULTADO GLOBAL
+          # ==================================================
+
+          echo ""
+          echo "========================================"
+          echo " Resultado global QA: $OVERALL_RESULT"
+          echo "========================================"
+
+          if [ "$OVERALL_RESULT" != "SUCCESS" ]; then
+            echo "[qa] FALLO: uno o mas paises no pasaron las pruebas."
+            echo "[qa] Despliegue NO aprobado."
+            exit 1
+          fi
+
+          echo "[qa] Todas las pruebas QA fueron exitosas."
+          echo "[qa] Despliegue aprobado."
