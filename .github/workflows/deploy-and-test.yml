@@ -94,18 +94,26 @@ jobs:
       - name: Trigger QA workflows and wait for results
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.QA_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.QA_GITHUB_TOKEN_DROPI }}
+          # ==========================================================
+          # GH_TOKEN para repo ribarr1: QA_GITHUB_TOKEN
+          # ==========================================================
           COUNTRIES: ${{ inputs.countries }}
           TEST_ENV: ${{ inputs.environment }}
           CUSTOM_TAGS: ${{ inputs.cucumber_tags }}
 
+        #  QA_OWNER="ribarr1"   QA_REPO="gsqai_dropi_automation"  QA_WORKFLOW="run-smoke.yml"
         run: |
-          set -e
+          set -euo pipefail
 
-          QA_OWNER="ribarr1"
-          QA_REPO="gsqai_dropi_automation"
-          QA_WORKFLOW="run-smoke.yml"
-          QA_BRANCH="main"
+          QA_OWNER="DROPI-SAS"
+          QA_REPO="dropi-test-atm"
+          QA_WORKFLOW="qa-smoke-tests.yml"
+          QA_BRANCH="develop"
+          QA_API_VERSION="2022-11-28"
+          POLL_INTERVAL_SECONDS=15
+          RUN_DISCOVERY_TIMEOUT_SECONDS=600
+          RESULT_TIMEOUT_SECONDS=3600
 
           echo "========================================"
           echo " QA AUTOMATION"
@@ -114,7 +122,17 @@ jobs:
           echo "Environment = $TEST_ENV"
           echo "----------------------------------------"
 
+          if [ -z "$GH_TOKEN" ]; then
+            echo "[qa] ERROR: no existe el secreto QA_GITHUB_TOKEN_DROPI"
+            exit 1
+          fi
+
           COUNTRIES_LIST=$(echo "$COUNTRIES" | tr ',' ' ')
+
+          if [ -z "$(echo "$COUNTRIES_LIST" | tr -d '[:space:]')" ]; then
+            echo "[qa] ERROR: debe especificarse al menos un pais"
+            exit 1
+          fi
 
           > /tmp/qa_runs.txt
 
@@ -156,30 +174,64 @@ jobs:
             echo "     ENV=$TEST_ENV"
             echo "     TAG=$TAG"
 
-            RESPONSE=$(curl -sS \
+            DISPATCHED_AT=$(date -u +%s)
+            PAYLOAD=$(jq -n \
+              --arg ref "$QA_BRANCH" \
+              --arg country "$C" \
+              --arg environment "$TEST_ENV" \
+              --arg cucumber_tags "$TAG" \
+              '{
+                ref: $ref,
+                inputs: {
+                  country: $country,
+                  environment: $environment,
+                  cucumber_tags: $cucumber_tags,
+                  reporting_iteration_id: "1"
+                }
+              }')
+
+            DISPATCH_RESPONSE=$(curl --fail-with-body -sS \
               -X POST \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer $GH_TOKEN" \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
+              -H "X-GitHub-Api-Version: $QA_API_VERSION" \
               "https://api.github.com/repos/$QA_OWNER/$QA_REPO/actions/workflows/$QA_WORKFLOW/dispatches" \
-              -d "{
-                \"ref\": \"$QA_BRANCH\",
-                \"inputs\": {
-                  \"country\": \"$C\",
-                  \"environment\": \"$TEST_ENV\",
-                  \"cucumber_tags\": \"$TAG\",
-                  \"reporting_iteration_id\": \"1\"
-                }
-              }")
+              -d "$PAYLOAD")
 
-            RUN_ID=$(echo "$RESPONSE" | jq -r '.workflow_run_id // empty')
-            RUN_URL=$(echo "$RESPONSE" | jq -r '.html_url // empty')
+            if [ -n "$DISPATCH_RESPONSE" ]; then
+              echo "[qa] Respuesta inesperada del dispatch: $DISPATCH_RESPONSE"
+            fi
+
+            RUN_ID=""
+            DISCOVERY_DEADLINE=$((DISPATCHED_AT + RUN_DISCOVERY_TIMEOUT_SECONDS))
+
+            # workflow_dispatch responde 204 y no devuelve el run creado.
+            # Buscamos el run nuevo por workflow, rama y fecha de creacion.
+            while [ -z "$RUN_ID" ] && [ "$(date -u +%s)" -lt "$DISCOVERY_DEADLINE" ]; do
+              RUNS_RESPONSE=$(curl --fail-with-body -sS \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: $QA_API_VERSION" \
+                "https://api.github.com/repos/$QA_OWNER/$QA_REPO/actions/workflows/$QA_WORKFLOW/runs?branch=$QA_BRANCH&event=workflow_dispatch&per_page=20")
+
+              RUN_ID=$(echo "$RUNS_RESPONSE" | jq -r --argjson dispatched_at "$DISPATCHED_AT" '
+                [.workflow_runs[]
+                  | select((.created_at | fromdateiso8601) >= $dispatched_at)]
+                | max_by(.created_at)
+                | .id // empty
+              ')
+
+              if [ -z "$RUN_ID" ]; then
+                sleep "$POLL_INTERVAL_SECONDS"
+              fi
+            done
 
             if [ -z "$RUN_ID" ]; then
-              echo "[qa] ERROR disparando QA para $C"
-              echo "$RESPONSE"
+              echo "[qa] ERROR: no se encontro el run de QA para $C dentro del timeout"
               exit 1
             fi
+
+            RUN_URL="https://github.com/$QA_OWNER/$QA_REPO/actions/runs/$RUN_ID"
 
             echo "[qa] Workflow creado."
             echo "[qa] Run ID: $RUN_ID"
@@ -209,12 +261,14 @@ jobs:
             echo "[qa] Esperando resultado de $COUNTRY..."
             echo "[qa] Run ID: $RUN_ID"
 
-            while true; do
+            RESULT_DEADLINE=$(($(date -u +%s) + RESULT_TIMEOUT_SECONDS))
 
-              RESPONSE=$(curl -sS \
+            while [ "$(date -u +%s)" -lt "$RESULT_DEADLINE" ]; do
+
+              RESPONSE=$(curl --fail-with-body -sS \
                 -H "Accept: application/vnd.github+json" \
                 -H "Authorization: Bearer $GH_TOKEN" \
-                -H "X-GitHub-Api-Version: 2026-03-10" \
+                -H "X-GitHub-Api-Version: $QA_API_VERSION" \
                 "https://api.github.com/repos/$QA_OWNER/$QA_REPO/actions/runs/$RUN_ID")
 
               STATUS=$(echo "$RESPONSE" | jq -r '.status // "unknown"')
@@ -233,9 +287,14 @@ jobs:
                 break
               fi
 
-              sleep 15
+              sleep "$POLL_INTERVAL_SECONDS"
 
             done
+
+            if [ "$STATUS" != "completed" ]; then
+              echo "[qa] ERROR: timeout esperando el workflow $RUN_ID"
+              OVERALL_RESULT="FAILED"
+            fi
 
             echo ""
             echo "[qa] $COUNTRY finalizado: $CONCLUSION"
